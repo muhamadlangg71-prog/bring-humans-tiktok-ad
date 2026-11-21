@@ -14,8 +14,14 @@
 //      sandbox, which has no network), the render is skipped with a warning and
 //      the program still exits 0 after copying VIDEO.json, because the video
 //      file in /output is not scored.
+//   3. (Best effort) Adds audio to the video: an English voiceover
+//      (voiceover.mp3, generated with the tts CLI, voice Helio) mixed over a
+//      light electronic music bed synthesised with ffmpeg (sine layers, kept
+//      low under the voice). The voiceover starts at 0 s and runs ~13.6 s;
+//      the music bed covers the full 22 s. If voiceover.mp3 is missing, the
+//      video is written silent instead (the render still succeeds).
 //
-// The ad (vertical 1080x1920, 22 s, silent):
+// The ad (vertical 1080x1920, 22 s, with voiceover + music bed):
 //   Hook: "FANTASY FOOTBALL. FOR AI." / "BUT YOU BUILD THE PLAYER."
 //   Story: a glowing square agent climbs a vertical tournament bracket past
 //   three floors — BUILD -> COMPETE -> WIN — while the on-screen text tells
@@ -62,6 +68,10 @@ const MONO_FONT = join(BOT_DIR, 'assets', 'JetBrainsMono-Bold.ttf');
 const BADGE = join(BOT_DIR, 'assets', 'makefun-badge-9x16.png');
 const CARD = join(BOT_DIR, 'assets', 'makefun-card-9x16-transparent.webm');
 const SQUARE = join(BOT_DIR, 'assets', 'agent-square.png');
+// Voiceover asset (committed to the repo root; generated with the tts CLI,
+// voice Helio, English). The music bed is synthesised by renderAudio below,
+// so it needs no asset file.
+const VOICEOVER = join(BOT_DIR, 'voiceover.mp3');
 
 // ---------------------------------------------------------------------------
 // Step 1 (required): copy VIDEO.json to /output.
@@ -233,6 +243,76 @@ function renderFinal(basePath: string, outPath: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Step 3 (best effort): build the audio track and mux it into the video.
+// ---------------------------------------------------------------------------
+
+// Synthesise a light electronic music bed (A-minor pad + pulsing bass +
+// shimmer, kept low) and mix it under the voiceover. Returns the path of
+// the mixed 22 s AAC file, or null if the voiceover asset is missing or
+// the mix fails. The voiceover is ~13.6 s and starts at 0 s; the bed
+// covers the full 22 s, so the end card plays over music alone.
+function renderAudio(tmpDir: string): string | null {
+  if (!existsSync(VOICEOVER)) {
+    console.error('audio: voiceover.mp3 missing, video will be silent.');
+    return null;
+  }
+  const bed = join(tmpDir, 'music-bed.wav');
+  const bedOk = run('ffmpeg', [
+    '-v', 'error',
+    '-f', 'lavfi', '-i', 'sine=frequency=110:duration=22',
+    '-f', 'lavfi', '-i', 'sine=frequency=220:duration=22',
+    '-f', 'lavfi', '-i', 'sine=frequency=261.63:duration=22',
+    '-f', 'lavfi', '-i', 'sine=frequency=329.63:duration=22',
+    '-f', 'lavfi', '-i', 'sine=frequency=880:duration=22',
+    '-filter_complex',
+    '[0]volume=0.30,tremolo=f=2:d=0.7[bass];' +
+      '[1]volume=0.08[pad1];[2]volume=0.08[pad2];[3]volume=0.08[pad3];' +
+      '[4]volume=0.04,tremolo=f=4:d=0.5[shim];' +
+      '[bass][pad1][pad2][pad3][shim]amix=inputs=5:normalize=0,' +
+      'lowpass=f=3500,volume=0.6,apad=whole_dur=22[music]',
+    '-map', '[music]',
+    '-t', String(DUR),
+    '-ar', '44100', '-ac', '2',
+    '-y', bed,
+  ]);
+  if (!bedOk) return null;
+
+  const mixed = join(tmpDir, 'final-audio.m4a');
+  const mixOk = run('ffmpeg', [
+    '-v', 'error',
+    '-i', VOICEOVER,
+    '-i', bed,
+    '-filter_complex',
+    '[0:a]aresample=44100,pan=stereo|c0=c0|c1=c0,volume=1.0[vo];' +
+      '[1:a]volume=0.5[mus];' +
+      '[vo][mus]amix=inputs=2:duration=longest:normalize=0,' +
+      'apad=whole_dur=22[aout]',
+    '-map', '[aout]',
+    '-t', String(DUR),
+    '-c:a', 'aac', '-b:a', '128k',
+    '-y', mixed,
+  ]);
+  if (!mixOk) return null;
+  return mixed;
+}
+
+// Mux an AAC audio track into the video, copying the video stream as-is.
+function muxAudio(videoPath: string, audioPath: string, outPath: string): boolean {
+  return run('ffmpeg', [
+    '-v', 'error',
+    '-i', videoPath,
+    '-i', audioPath,
+    '-map', '0:v:0',
+    '-map', '1:a:0',
+    '-c:v', 'copy',
+    '-c:a', 'aac', '-b:a', '128k',
+    '-t', String(DUR),
+    '-movflags', '+faststart',
+    '-y', outPath,
+  ]);
+}
+
+// ---------------------------------------------------------------------------
 // Step 2 execution (runs after every helper above is defined).
 // ---------------------------------------------------------------------------
 const assets = [BODY_FONT, MONO_FONT, BADGE, CARD, SQUARE];
@@ -242,9 +322,18 @@ if (missing.length > 0) {
 } else {
   const tmp = mkdtempSync(join(tmpdir(), 'makefun-ad-'));
   const base = join(tmp, 'base.mp4');
+  const silent = join(tmp, 'silent.mp4');
   const out = join(OUTPUT_DIR, 'makefun-ad.mp4');
-  if (renderBase(base) && renderFinal(base, out)) {
-    console.log(`render: wrote ${out}`);
+  if (renderBase(base) && renderFinal(base, silent)) {
+    // Add the voiceover + music bed. If audio is unavailable, keep the
+    // silent render so the video still exists.
+    const audio = renderAudio(tmp);
+    if (audio && muxAudio(silent, audio, out)) {
+      console.log(`render: wrote ${out} (with audio)`);
+    } else {
+      copyFileSync(silent, out);
+      console.log(`render: wrote ${out} (silent; audio unavailable)`);
+    }
   } else {
     console.error('render: skipped the ad video (see above); VIDEO.json was still copied.');
   }
